@@ -1,0 +1,604 @@
+---
+title: "Crab data - preliminary analysis"
+author: "Laura H Spencer"
+date: "5/16/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+getwd()
+```
+
+### Load libraries and source scripts 
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+source("biostats.R")
+
+list.of.packages <- c("DESeq2", "RCurl", "tidyverse", "vegan", "pheatmap", "pastecs", "factoextra", "FactoMineR", "RColorBrewer", "tibble", "reshape2", "plotly") #add new libraries here 
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+# Load all libraries 
+lapply(list.of.packages, FUN = function(X) {
+  do.call("require", list(X)) 
+})
+```
+
+### Import counts matrix file as dataframe. 
+```{r}
+counts <- read.table(text=getURL("https://raw.githubusercontent.com/RobertsLab/code/master/r_projects/sam/20200430_cbai_deg_multiple_conditions/data/salmon.gene.counts.matrix"), header = TRUE, stringsAsFactors = F, fill=FALSE) 
+
+names(counts) <- sub("_quant", "", sub("X", "", names(counts))) #remove "X" and "_quant" from sample/column names"
+```
+
+### Import sample info 
+```{r}
+sample.info <- read.csv(text=getURL("https://raw.githubusercontent.com/RobertsLab/code/master/r_projects/sam/20200430_cbai_deg_multiple_conditions/data/cbai_2020gw_rnaseq_sample_info.csv"), header = TRUE, stringsAsFactors = T, fill=FALSE) %>% 
+  mutate(day=as.factor(str_replace(day, pattern="D", replacement=""))) %>% #convert day to factor 
+  mutate(temperature=fct_relevel(temperature, c("cold", "ambient", "warm")))
+```
+
+### Summarize counts
+```{r}
+print(paste("Number of samples:", ncol(counts), sep=" "))
+print(paste("Total number of genes in dataframe:", prettyNum(nrow(counts), big.mark = ","), sep=" "))
+print(paste("Total counts, all samples:", prettyNum(sum(colSums(counts)), big.mark = ","), sep=" "))
+print(paste("Counts for", colnames(counts), ":",  prettyNum(colSums(counts), big.mark = ","), sep=" "))
+barplot(colSums(counts), main="Total counts by sample", las=2) #inspect total counts by sample
+barplot(log(colSums(counts)), main="Log(total counts) by sample", las=2) #inspect total counts by sample
+ncol(counts)
+```
+
+## IMPORTANT NOTE: Should you wish to remove samples with very low counts, you can do so here 
+
+```{r}
+# remove.list <- c("73", "427", "349" ,"425", "463") #enter the samples you wish to remove here
+# counts <- counts[ , -which(names(counts) %in% remove.list)]
+# ncol(counts)
+# sample.info <- sample.info[ -which(sample.info$sample_id %in% remove.list), ]
+# nrow(sample.info)
+# 
+# nrow(sample.info) == ncol(counts) #should = TRUE. 
+```
+
+###  Round all non-integers up 
+```{r}
+counts <- ceiling(counts)
+```
+
+### Transpose dataframe so each row = a sample (aka "objects"), and each column = genes (aka "variables") 
+```{r}
+counts.t <- t(counts) #transform data to have each sample a row, each column a gene 
+```
+
+### Drop genes that don't show up in any samples (why are they here?)
+```{r}
+print(paste("#if just one sample had a gene, what would that % be? ", 100*(1/nrow(counts.t))))
+counts.ts <- drop.var(counts.t, min.po = ceiling(100*(1/nrow(counts.t))))  #drop those genes that aren't present in any sample  
+print(paste("# of genes not present in samples & dropped:", ncol(counts.t) - ncol(counts.ts), sep=" "))
+```
+
+## Drop genes with very little variability between all samples, using minimum coefficient variation (min.cv)=5
+```{r}
+counts.tsv <- drop.var(counts.ts, min.cv=5) 
+print(paste("number of genes dropped due to low variance", ncol(counts.ts) - ncol(counts.tsv)))
+
+print(paste("# number of genes remain in dataset after filtering: ", ncol(counts.tsv))) 
+```
+
+## Use foa.plots to visualize data a bit: 
+
+### In how many samples does each gene occur? 
+  - The **first four plots portray the gene’ frequency of occurrence among samples** in a number of different ways – either as an empirical cumulative distribution function (ECDF) of gene occurrence or as a histogram of gene occurrence. 
+
+### What is the mean abundance of each gene when it occurs (not averaging zeros for samples where it is absent)? 
+  - The **fifth plot is an ECDF of gene mean abundance.** X-axis is samples, ranked from 1-n in terms of mean gene abundance. 
+  
+### Is the mean abundance of genes correlated with the number of samples they occur in? 
+  - The **sixth plot is a scatter plot of frequency of occurrence against mean abundance**. Is there any apparent relationship between the two? Are the widespread genes also generally more abundant? Are there many widespread genes that occur at low abundance? Conversely, are there genes much less widespread, but abundant where they occur?
+
+### Is the total abundance of gene in a sample correlated with the number of gene in a sample? To answer this question, first it is instructive to look at the number of gene per sample. 
+  - The **eighth plot depicts the ECDF of sample richness.** Are there any interesting patterns? For example, do most samples support an average number of gene, while only a few samples supporting either very few or very many gene? Or is the pattern different?
+
+### Second, what is the pattern in the distribution of sample total abundance? 
+  - The **ninth plot is the ECDF of total sample abundance.** How does it compare to the ECDF of sample richness?
+
+### Finally, to answer the question on the relation between total abundance and number of gene/sample ...
+  - The **last plot is a scatter plot of the two variables.** Is there is relationship between the _number of genes per sample and the total abundance?_ Do gene-rich samples generally have a greater total abundance of those genes as well? 
+
+```{r}
+# note: you'll need to press return in the console for all plots 
+foa.plots(counts.ts)
+```
+
+### Merge sample key info to count data, then sort, and generate heat map for initial inspection by treatment 
+```{r}
+# merge count data with sample key, reset row names as sample names, and arrange by infection, then temperature, then day 
+counts.tsvk <- merge(x=sample.info, by.x="sample_id", y=counts.tsv, by.y="row.names") %>% 
+  arrange(infection_status, temperature, day)  %>% column_to_rownames(var="sample_id") 
+
+counts.tsvk[,1:10] #check out results of merge/arrange
+```
+
+### Generate heat map of counts before DESeq processing / analysis 
+
+NOTE: scale="column" b/c range of counts is so huge, so counts have been scaled 
+
+```{r}
+pheatmap(data.matrix(counts.tsvk[,-1:-3]), Rowv=NA, Colv=NA, na.rm = TRUE, xlab = NA, show_colnames =FALSE, cluster_cols = FALSE, cluster_rows = TRUE, scale="column", color=c("dodgerblue3", "goldenrod1"), main = "Crab Gene Counts", annotation_row=counts.tsvk[1:3])
+```
+
+# Analysis in DESeq2  
+
+### Reformat for DESeq, ensure correct sample order for 
+
+NOTE: It is absolutely critical that the **columns of the count matrix** and the **rows of the column data (information about samples)** are in the same order. DESeq2 will not make guesses as to which column of the count matrix belongs to which row of the column data, these must be provided to DESeq2 already in consistent order.
+
+```{r}
+all(rownames(counts.tsvk) == counts.tsvk[-1:-3] %>% t() %>% colnames()) #check that rownames of untransformed matrix match column names of transformed matrix. Should print 'TRUE' 
+```
+
+# Generate DESeq datasets with various treatment comparisons  
+
+```{r}
+dds.all <- DESeqDataSetFromMatrix(countData = counts.tsvk[-1:-3] %>% t(),
+                              colData = counts.tsvk[1:3],
+                              design = ~ infection_status + temperature + day)
+dds.all$day <- factor(dds.all$day, levels = c("9","12", "26")) #relevel day factor 
+
+# dds.status <- DESeqDataSetFromMatrix(countData = counts.tsvk[-1:-3] %>% t(),
+#                               colData = counts.tsvk[1:3],
+#                               design = ~ infection_status)
+# 
+# dds.temperature <- DESeqDataSetFromMatrix(countData = counts.tsvk[-1:-3] %>% t(),
+#                               colData = counts.tsvk[1:3],
+#                               design = ~ temperature)
+# 
+# dds.day <- DESeqDataSetFromMatrix(countData = counts.tsvk[-1:-3] %>% t(),
+#                               colData = counts.tsvk[1:3],
+#                               design = ~ day)
+```
+
+### Pre-filtering - remove rows (genes) with less than a total of 10 reads (across all samples)
+
+```{r}
+keep <- rowSums(counts(dds.all)) >= 10
+dds.all <- dds.all[keep,]
+print(paste("# genes remaining after pre-filtering:", nrow(dds.all)))
+```
+
+# Visualize data via PCAs and heat maps 
+
+## Transform data 
+
+- Here we transform counts using a variance stabilizing transformation (VST), since the rlog transformation threw an error and suggested using VST.  
+- Here we use `blind=FALSE` b/c we are interested in differences explained by experimental design, and may wish to use this transformed data in downstream analyses. 
+```{r}
+vsd.all <- varianceStabilizingTransformation(dds.all, blind=FALSE)
+```
+
+## Visualize sample clustering via PCA (after transformation)
+
+NOTE: Hover over points to see the sample numbers
+
+```{r}
+# PCA with points color coded by infection status 
+ggplotly(plotPCA(vsd.all, intgroup="infection_status") + 
+           ggtitle("PCA by infection status (var-stabilizing transformed)") + geom_point(size=3, aes(text=colnames(vsd.all))), tooltip = "text")
+
+# PCA with points color coded by temperature 
+ggplotly(plotPCA(vsd.all, intgroup="temperature") + 
+           ggtitle("PCA by temperature (var-stabilizing transformed)") + geom_point(size=3, aes(text=colnames(vsd.all))), tooltip = "text")
+
+# PCA with points color coded by day
+ggplotly(plotPCA(vsd.all, intgroup="day") + 
+           ggtitle("PCA by temperature (var-stabilizing transformed)") + geom_point(size=3, aes(text=colnames(vsd.all))), tooltip = "text")
+```
+
+### Generate heat maps before & after transformation  
+
+```{r}
+# extract treatment info from VSD transformation 
+vsd.all.df <- as.data.frame(colData(vsd.all)[,c("day","infection_status", "temperature")])
+
+# generate heatmap from untransformed counts 
+pheatmap(counts(dds.all), cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=TRUE, annotation_col=vsd.all.df, scale = "row", main="Crab Counts, untransformed data (but scaled by rows")
+
+# generate heatmap from VSD counts 
+pheatmap(assay(vsd.all), cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=TRUE, annotation_col=vsd.all.df, main = "Crab Counts, VSD-transformed")
+```
+
+### Heatmap of the sample-to-sample distances
+Another use of the transformed data is sample clustering. Here, we apply the dist function to the transpose of the transformed count matrix to get sample-to-sample distances.
+
+A heatmap of this distance matrix gives us an overview over similarities and dissimilarities between samples. We have to provide a hierarchical clustering hc to the heatmap function based on the sample distances, or else the heatmap function would calculate a clustering based on the distances between the rows/columns of the distance matrix.
+
+```{r}
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+
+sampleDists <- dist(t(assay(vsd.all)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+# Set row names based on factors of interest. Here we show infection status + sample name 
+rownames(sampleDistMatrix) <- paste(vsd.all$infection_status, names(vsd.all$sizeFactor), sep="-") #set row names 
+colnames(sampleDistMatrix) <- NULL
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+# Here we show day + infection status
+rownames(sampleDistMatrix) <- paste(vsd.all$infection_status, vsd.all$day, sep="-") #set row names 
+colnames(sampleDistMatrix) <- NULL
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+# Here we show temperature + infection status
+rownames(sampleDistMatrix) <- paste(vsd.all$infection_status, vsd.all$temperature, sep="-") #set row names 
+colnames(sampleDistMatrix) <- NULL
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+# etc. ... can adjust the row names based on interest. Distance matrix should remain the same. 
+```
+
+## Differential Expression Analysis - multifactor design 
+
+### Run the function `DESeq` to assess differential expression 
+
+```{r}
+dds.all.DESeq <- DESeq(dds.all) 
+```
+
+### Reformat DESeqDataSet as multifactor design 
+
+IMPORTANT NOTE: DESeq provides the option to add an interaction term. So, if you'er interested in looking at the interaction between infection status & temperature, you could try the following. 
+
+`design(dds.all) <- formula(~ infection_status + temperature + infection_status:temperature)`
+
+Check out the DESeq manual for more info. 
+
+```{r}
+dds.multi.DESeq <- dds.all.DESeq #duplicate DESeq object for multi-factor design 
+colData(dds.multi.DESeq) # check out treatments 
+design(dds.multi.DESeq) <- formula(~ infection_status + temperature + day) # define experimental design as multi-factor 
+dds.multi.DESeq <- DESeq(dds.multi.DESeq)  #re-run DESeq to update analysis for multi-factor design 
+```
+
+## Extract differential expression results / comparisons among different factors 
+
+Create results objects, but summary of results are also shown
+
+NOTE: can only compare two treatments at a time
+
+```{r}
+# view names to use 
+# resultsNames(dds.multi.DESeq)
+
+print("Comparison: infected vs. uninfected")
+summary(res.all.status <- results(dds.multi.DESeq, contrast=c("infection_status", "uninfected", "infected"), alpha=0.05))
+
+print("Comparison: cold vs. warm")
+summary(res.all.ColdVSWarm <- results(dds.multi.DESeq, contrast=c("temperature", "cold", "warm"), alpha=0.05))
+
+print("Comparison: cold vs. ambient") 
+summary(res.all.ColdVSAmb <- results(dds.multi.DESeq, contrast=c("temperature", "cold", "ambient"), alpha=0.05))
+
+print("Comparison: warm vs. ambient") 
+summary(res.all.AmbVSWarm <- results(dds.multi.DESeq, contrast=c("temperature", "ambient", "warm"), alpha=0.05))
+
+print("Comparison: Day 9 vs. day 26")
+summary(res.all.9vs26 <- results(dds.multi.DESeq, contrast=c("day", "9", "26"), alpha=0.05))
+
+print("Comparison: Day 12 vs. day 26")
+summary(res.all.12vs26 <- results(dds.multi.DESeq, contrast=c("day", "12", "26"), alpha=0.05))
+  
+print("Comparison: Day 9 vs. day 12")
+summary(res.all.9vs12 <- results(dds.multi.DESeq, contrast=c("day", "9", "12"), alpha=0.05))
+
+print("Descriptionds of the results columns")
+mcols(res.all.status)$description
+```
+
+## Count # of genes diff expressed  (p-value <0.05) in each comparison 
+
+```{r}
+paste("No. of genes differentially expressed (padj<0.05) by infection status:",  sum(res.all.status$padj < 0.05, na.rm=TRUE))
+
+paste("No. of genes differentially expressed (padj<0.05) among cold & warm treatments:",  sum(res.all.ColdVSWarm$padj < 0.05, na.rm=TRUE))
+paste("No. of genes differentially expressed (padj<0.05) among ambient & warm treatments:",  sum(res.all.AmbVSWarm$padj < 0.05, na.rm=TRUE))
+paste("No. of genes differentially expressed (padj<0.05) among ambient & cold treatments:",  sum(res.all.ColdVSAmb$padj < 0.05, na.rm=TRUE))
+
+paste("No. of genes differentially expressed (padj<0.05) among day 9 and 26:",  sum(res.all.9vs26$padj < 0.05, na.rm=TRUE))
+paste("No. of genes differentially expressed (padj<0.05) among day 9 and 12:",  sum(res.all.9vs12$padj < 0.05, na.rm=TRUE))
+paste("No. of genes differentially expressed (padj<0.05) among day 12 and 26:",  sum(res.all.12vs26$padj < 0.05, na.rm=TRUE))
+```
+
+## Extract stats for significantly different genes for each comparison 
+
+```{r}
+diffex.status <- subset(res.all.status, padj < 0.05)
+
+diffex.ColdVSWarm <- subset(res.all.ColdVSWarm, padj < 0.05)
+diffex.AmbVSWarm <- subset(res.all.AmbVSWarm, padj < 0.05)
+diffex.ColdVSAmb <- subset(res.all.ColdVSAmb, padj < 0.05)
+
+diffex.9vs26 <- subset(res.all.9vs26, padj < 0.05)
+diffex.9vs12 <- subset(res.all.9vs12, padj < 0.05)
+diffex.12vs26 <- subset(res.all.12vs26, padj < 0.05)
+```
+
+## Extract counts for differentially expressed genes for each comparison 
+
+```{r}
+diffex.status.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.status))
+
+diffex.ColdVSWarm.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.ColdVSWarm))
+diffex.AmbVSWarm.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.AmbVSWarm))
+diffex.ColdVSAmb.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.ColdVSAmb))
+
+diffex.9vs26.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.9vs26))
+diffex.9vs12.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.9vs12))
+diffex.12vs26.counts <- subset(counts(dds.multi.DESeq), rownames(dds.multi.DESeq) %in% rownames(diffex.12vs26))
+```
+
+# generate heatmap with differentially expressed genes by infection status 
+
+```{r}
+dds.all.df <- as.data.frame(colData(dds.all)[,c("day","infection_status", "temperature")])
+all(colnames(diffex.status.counts) == rownames(dds.all.df)) #double check that samples are still in same order 
+
+pheatmap(diffex.status.counts, cluster_rows=F, show_rownames=FALSE, cluster_columns=TRUE, na.rm=TRUE, scale="row", main = "Crab Gene Counts, all differentially expressed genes", annotation_col=dds.all.df[2], color=c("dodgerblue3", "goldenrod1"))
+```
+
+## Merge diff expressed genes among temperature, generate heatmap with differentially expressed genes by temperature 
+
+```{r}
+diffex.temp.counts <- 
+  rbind.data.frame( 
+      diffex.ColdVSWarm.counts, 
+      diffex.ColdVSWarm.counts,
+      diffex.ColdVSWarm.counts) %>% 
+  rownames_to_column("gene") %>%
+    arrange(gene)
+
+# are there any duplicate genes? 
+diffex.temp.counts[duplicated(diffex.temp.counts$gene), ]
+
+pheatmap(diffex.temp.counts[-1], cluster_rows=F, show_rownames=FALSE, cluster_columns=TRUE, na.rm=TRUE, scale="row", main = "Crab Gene Counts, differentially expressed genes by temperature", annotation_col=dds.all.df[3], color=c("dodgerblue3", "goldenrod1"))
+```
+
+## Merge diff expressed genes among days, generate heatmap with differentially expressed genes by temperature 
+
+```{r}
+diffex.day.counts <- 
+  rbind.data.frame(
+      diffex.9vs26.counts,
+      diffex.9vs12.counts,
+      diffex.12vs26.counts) %>% 
+  rownames_to_column("gene") %>%
+    arrange(gene) 
+
+# are there any duplicate genes? 
+diffex.day.counts[duplicated(diffex.day.counts$gene), ]
+
+pheatmap(diffex.day.counts[-1], cluster_rows=F, show_rownames=FALSE, cluster_columns=TRUE, na.rm=TRUE, scale="row", main = "Crab Gene Counts, differentially expressed genes by temperature", annotation_col=dds.all.df[1], color=c("dodgerblue3", "goldenrod1"))
+```
+
+## Plot gene counts for a selection of genes 
+
+It can also be useful to examine the counts of reads for a single gene across the groups. A simple function for making this plot is **`plotCounts`, which normalizes counts by sequencing depth and adds a pseudocount of 1/2 to allow for log scale plotting.** The counts are grouped by the variables in intgroup, where more than one variable can be specified. Here we specify the gene which had the smallest p value from the results table created above. You can select the gene to plot by rowname or by numeric index.
+
+### Here we plot the top 8 genes (lowest p-values) differentially expressed between infected & uninfected crabs 
+
+```{r}
+res.all.status.ordered <- res.all.status[order(res.all.status$pvalue),]
+status.p05.names <-rownames(subset(res.all.status.ordered, pvalue < 0.05)) 
+
+#plot the 8 genes with lowest p-values 
+par(mfrow=c(3,3), mai = c(.3, .3, .1, .1), oma=c(0,0,4,0))
+for (i in 1:8) {plotCounts(dds.multi.DESeq, gene=status.p05.names[i], intgroup="infection_status")}
+mtext("Top 9 differentially expressed genes by INFECTION STATUS", side=3,  line=1, outer=TRUE)
+```
+
+### Here we plot the top 9 genes (lowest p-values) differentially expressed between temperature treatments (3 top genes per comparison)
+
+```{r}
+temperature.top9 <- c(
+rownames(diffex.ColdVSWarm[order(diffex.ColdVSWarm$padj),][1:3,]),
+rownames(diffex.AmbVSWarm[order(diffex.AmbVSWarm$padj),][1:3,]),
+rownames(diffex.ColdVSAmb[order(diffex.ColdVSAmb$padj),][1:3,]))
+
+#plot the 9 genes with lowest p-values in each of the 3 temperature comparisons 
+par(mfrow=c(3,3), mai = c(.3, .3, .1, .1), oma=c(0,0,4,0))
+for (i in 1:9) {plotCounts(dds.multi.DESeq, gene=temperature.top9[i], intgroup="temperature")}
+mtext("Top 9 differentially expressed genes by TEMPERATURE", side=3,  line=1, outer=TRUE)
+```
+
+### Here we plot the top 9 genes (lowest p-values) differentially expressed between days (3 top genes per comparison)
+
+```{r}
+day.top9 <- c(
+rownames(diffex.9vs12[order(diffex.9vs12$padj),][1:3,]),
+rownames(diffex.9vs26[order(diffex.9vs26$padj),][1:3,]),
+rownames(diffex.12vs26[order(diffex.12vs26$padj),][1:3,]))
+
+#plot the 9 genes with lowest p-values in each of the 3 day comparisons 
+par(mfrow=c(3,3), mai = c(.3, .3, .1, .1), oma=c(0,0,4,0))
+for (i in 1:9) {plotCounts(dds.multi.DESeq, gene=day.top9[i], intgroup="day")}
+mtext("Top 9 differentially expressed genes by DAY", side=3,  line=1, outer=TRUE)
+``` 
+
+# Create master dataframe of all differentially expressed genes across all comparisons 
+
+```{r}
+diffex.all.counts <- 
+  rbind.data.frame(
+    diffex.status.counts,
+    diffex.ColdVSWarm.counts,
+    diffex.AmbVSWarm.counts,
+    diffex.ColdVSAmb.counts,
+    diffex.9vs26.counts,
+    diffex.9vs12.counts,
+    diffex.12vs26.counts) %>% 
+  rownames_to_column("gene") %>%
+    arrange(gene)
+  
+# are there any duplicate genes? no. 
+diffex.all.counts[duplicated(diffex.all.counts), ]
+
+# Move first column with gene names to row names 
+diffex.all.counts <- diffex.all.counts %>% 
+  column_to_rownames("gene")
+```
+
+# Of all differentially expressed genes (all comparisons), which are the most influential of sample ordination in multivariate space? 
+
+## Run PCA on list of differentially expressed genes (across all comparisons) 
+
+NOTE: set scale=false to use a variance-covariance matrix, putting more weight on genes with higher counts. 
+
+_Notes from multivariate class notes_: 
+PCA is sensitive to the scale of measurement of the data. If all the data are not measured on the same scale, using covariance means that the result will be determined mostly by the variable with the largest values, as it will have the highest variance. Using a correlation matrix treats all variables the same (standardized to mean=0 and std. dev.=1). In prcomp(), this means specifying scale=TRUE in the function call.
+
+### Perform PCA 
+
+```{r}
+diff.pca<-FactoMineR::PCA(t(diffex.all.counts),graph=F) #note: need to transform count frame for this PCA 
+```
+
+### Scree plot shows how much variance is explained by each Principal Component (PC) Axis: 
+
+- PC Axis 1 explains 31.3% of variance  
+- PC Axis 2 explains 10.9% of variance  
+- PC Axis 3 explains 9.3% of variance   
+
+```{r}
+fviz_screeplot(diff.pca, addlabels = TRUE)
+```
+
+### Look at the relative contributions of each SAMPLE to PC axes 1, 2, and 3
+
+```{r}
+fviz_contrib(diff.pca, choice = "ind", axes = 1) + ggtitle("Contribution of samples to PC dimension #1")
+fviz_contrib(diff.pca, choice = "ind", axes = 2) + ggtitle("Contribution of samples to PC dimension #2")
+fviz_contrib(diff.pca, choice = "ind", axes = 3) + ggtitle("Contribution of samples to PC dimension #3")
+```
+
+# Plot PC scores for axis 1 ~ axis 2, by treatment 
+
+```{r}
+pca.key <- sample.info[order(match(sample.info$sample_id, rownames(diff.pca$ind$coord))), ] #create key with samples ordered by same order as they are in the PCA 
+
+# PCA plots with samples, color coded by treatments 
+fviz_pca_biplot(diff.pca, axes = c(1,2), repel = TRUE, label = c("ind"), invisible = "var", select.var = list(contrib = 5), col.ind = pca.key$infection_status, title = "PC1 ~ PC2, color=infection status") 
+fviz_pca_biplot(diff.pca, axes = c(1,2), repel = TRUE, label = c("ind"), invisible = "var", select.var = list(contrib = 5), col.ind = pca.key$temperature, title = "PC1 ~ PC2, color=temperature") 
+fviz_pca_biplot(diff.pca, axes = c(1,2), repel = TRUE, label = c("ind"), invisible = "var", col.ind = pca.key$day, title = "PC1 ~ PC2, color=day sampled")
+
+# PCA with samples + top 10 genes contributing to PC scores 
+fviz_pca_biplot(diff.pca, axes = c(1,2), repel = TRUE, label = c("ind", "var"), select.var = list(contrib = 10)) 
+```
+
+# Plot PC scores for axis 1 ~ axis 3, by treatment 
+
+```{r}
+pca.key <- sample.info[order(match(sample.info$sample_id, rownames(diff.pca$ind$coord))), ] #create key with samples ordered by same order as they are in the PCA 
+
+# PCA plots with samples, color coded by treatments 
+fviz_pca_biplot(diff.pca, axes = c(1,3), repel = TRUE, label = c("ind"), invisible = "var", select.var = list(contrib = 5), col.ind = pca.key$infection_status, title = "PC1 ~ PC3, color=infection status") 
+fviz_pca_biplot(diff.pca, axes = c(1,3),repel = TRUE, label = c("ind"), invisible = "var", select.var = list(contrib = 5), col.ind = pca.key$temperature, title = "PC1 ~ PC3, color=temperature") 
+fviz_pca_biplot(diff.pca, axes = c(1,3),repel = TRUE, label = c("ind"), invisible = "var", col.ind = pca.key$day, title = "PC1 ~ PC3, color=day sampled")
+
+# PCA with samples + top 10 genes contributing to PC scores 
+fviz_pca_biplot(diff.pca, axes = c(1,3),repel = TRUE, label = c("ind", "var"), select.var = list(contrib = 10)) 
+```
+
+# Plot PC scores for axis 2 ~ axis 3, by treatment 
+
+```{r}
+pca.key <- sample.info[order(match(sample.info$sample_id, rownames(diff.pca$ind$coord))), ] #create key with samples ordered by same order as they are in the PCA 
+
+# PCA plots with samples, color coded by treatments 
+fviz_pca_biplot(diff.pca, axes = c(2,3), repel = TRUE, label = c("ind"), invisible = "var", select.var = list(contrib = 5), col.ind = pca.key$infection_status, title = "PC2 ~ PC3, color=infection status") 
+fviz_pca_biplot(diff.pca, axes = c(2,3),repel = TRUE, label = c("ind"), invisible = "var", select.var = list(contrib = 5), col.ind = pca.key$temperature, title = "PC2 ~ PC3, color=temperature") 
+fviz_pca_biplot(diff.pca, axes = c(2,3),repel = TRUE, label = c("ind"), invisible = "var", col.ind = pca.key$day, title = "PC2 ~ PC3, color=day sampled")
+
+# PCA with samples + top 10 genes contributing to PC scores 
+fviz_pca_biplot(diff.pca, axes = c(2,3),repel = TRUE, label = c("ind", "var"), select.var = list(contrib = 10)) 
+```
+
+## Extract PC data for genes, showing their relative contributions to PC PC Axis 1 ~ Axis 2  
+
+```{r}
+diff.pca.gene.data <- fviz_pca_var(diff.pca, axes = c(1,2), select.var = list(contrib = 100))$data 
+head(diff.pca.gene.data)
+```
+
+# Extract PC scores for each sample - are they distributed normally in multivarite space? 
+
+```{r}
+pca.sample.scores <- diff.pca$ind
+hist(unlist(as.data.frame(pca.sample.scores)[1:3], use.names=FALSE), main="Histogram of PC scores for dimensions 1, 2 & 3") #should have normal distribution for multivariate normality 
+```
+
+## Prepare data for downtream statistics (if desired) 
+
+The following creates a master dataframe from the differentially expressed genes with sample id, treatment info, and counts, in long format 
+
+# Note: instead of `data.frame(t(diffex.all.counts)) %>%` you could easily swap in `data.frame(t(counts(dds.all))) %>%` go generate the same dataframe, but with all genes (not just differentially expressed ones)
+
+```{r}
+counts4stats <- sample.info %>% 
+  mutate(sample_id=as.character(sample_id)) %>%
+  right_join(
+    data.frame(t(diffex.all.counts)) %>% 
+  rownames_to_column("sample_id")
+  ) %>% 
+  pivot_longer(cols=starts_with("TRINITY"), values_to = "count", names_to = "gene")
+head(counts4stats)
+```
+
+## Even more visualization 
+
+### MA-plots
+
+In DESeq2, the function plotMA shows the log2 fold changes attributable to a given variable over the mean of normalized counts for all the samples in the DESeqDataSet. Points will be colored **red if the padj<0.05**. Points which fall out of the window are plotted as open triangles pointing either up or down.
+
+```{r}
+plotMA(res.all.status, main="DEG by infection status\nLog2 fold change ~ mean of normalized counts")
+
+plotMA(res.all.ColdVSWarm, main="DEGs between Cold & Warm\nLog2 fold change ~ mean of normalized counts")
+plotMA(res.all.AmbVSWarm, main="DEGs between Ambient & Warm\nLog2 fold change ~ mean of normalized counts")
+plotMA(res.all.ColdVSAmb, main="DEGs between Ambient & Cold\nLog2 fold change ~ mean of normalized counts")
+
+plotMA(res.all.9vs26, main="DEGs between Day 9 & Day 26\nLog2 fold change ~ mean of normalized counts")
+plotMA(res.all.9vs12, main="DEGs between Day 9 & Day 12\nLog2 fold change ~ mean of normalized counts")
+plotMA(res.all.12vs26, main="DEGs between Day 12 & Day 26\nLog2 fold change ~ mean of normalized counts")
+```
+
+### You can also make MA-plots with transformations 
+
+Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes. To shrink the LFC, we pass the dds object to the function lfcShrink. Below we specify to use the apeglm method for effect size shrinkage (Zhu, Ibrahim, and Love 2018), which improves on the previous estimator.
+
+We provide the dds object and the name or number of the coefficient we want to shrink, where the number refers to the order of the coefficient as it appears in resultsNames(dds).
+
+### Here we apply `lfcShrink()` function to the dds.multi.DESeq object, and specify `coef=2` to specify that we want to examine DEGs between infection status by each shrinkage method. 
+
+```{r}
+resultsNames(dds.multi.DESeq) # Check the order of coefficients to use in the lfcShrink function.
+# use `coef=2` to refers to infection status 
+
+# Generate MA-plots after the different effect size shrinkage methods 
+# par(mfrow=c(1,3), mar=c(4,4,2,1))
+# plotMA(lfcShrink(dds.multi.DESeq, coef=2, type="apeglm"),  main="apeglm")
+# plotMA(lfcShrink(dds.multi.DESeq, coef=2, type="normal"), main="normal")
+# plotMA(lfcShrink(dds.multi.DESeq, coef=2, type="ashr"), main="ashr")
+```
